@@ -1,41 +1,48 @@
-"""Daily portfolio simulation with lagged execution and costs.
+"""Event-driven daily backtest.
 
 Timing, which is where backtests lie (spec 20.1):
 
-- A decision on signal date s uses closes up to and including s.
-- It executes `execution_delay` sessions later, at that session's close.
-- The new weights earn returns only from the session after execution.
+- The strategy decides at the close of session t using data up to t.
+- Its orders fill at the OPEN of session t + execution_delay (default 1), so no
+  signal ever shares a price with the data that produced it. A delay below one
+  session is refused.
+- Every fill pays half the spread plus slippage for that instrument (spec 8).
+- Idle cash earns the T-bill ETF's return.
 
-So no signal ever shares a return with the data that produced it. A delay
-below one session is refused.
+The engine calls exactly the same `Strategy.step` the live runner calls.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-from ..config import CASH_TICKER, COST_BPS, HOLDOUT_START
-from ..pipeline import Decision, decide
+from ..config import CASH_TICKER, DEFAULT_PARAMS, HOLDOUT_START, MAX_DRAWDOWN_HALT, Params, cost_bps
+from ..data.market import Market
+from ..features import Features, build_features
+from ..positions import Book
+from ..execution.orders import Order
+from ..strategy import Strategy, apply_fill
 
 
 @dataclass
 class BacktestConfig:
     start: str
     end: str
-    cost_bps: float = COST_BPS
+    initial_capital: float = 1_000_000.0
     execution_delay: int = 1
+    cost_multiplier: float = 1.0  # 0 = frictionless, for structural tests only
     cash_ticker: str | None = CASH_TICKER
+    drawdown_halt: float | None = MAX_DRAWDOWN_HALT  # spec 11.3: flatten and stop
     holdout_start: str = HOLDOUT_START
     use_holdout: bool = False
 
     def validate(self) -> None:
         if self.execution_delay < 1:
             raise ValueError("execution_delay must be at least one session (no look-ahead)")
-        if self.cost_bps < 0:
-            raise ValueError("cost_bps cannot be negative")
+        if self.cost_multiplier < 0:
+            raise ValueError("cost_multiplier cannot be negative")
         if not self.use_holdout and pd.Timestamp(self.start) >= pd.Timestamp(self.holdout_start):
             raise ValueError(
                 f"start {self.start} is inside the holdout (from {self.holdout_start}); "
@@ -52,111 +59,173 @@ class BacktestConfig:
 @dataclass
 class BacktestResult:
     equity: pd.Series
-    turnover: pd.Series
-    weights: pd.DataFrame  # target weights at each execution date
-    decisions: list[Decision] = field(default_factory=list)
+    invested: pd.Series  # fraction of equity in positions
+    trades: pd.DataFrame  # every fill
+    round_trips: pd.DataFrame  # every closed position
+    decisions: list[dict] = field(default_factory=list)  # sessions that produced orders
+    halted_on: str | None = None  # date the drawdown hard stop fired, if it did
     config: BacktestConfig | None = None
+    params: Params | None = None
 
-
-def month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
-    """Last trading session of each calendar month present in `index`."""
-    s = index.to_series()
-    return list(s.groupby(index.to_period("M")).max())
-
-
-def simulate(
-    prices: pd.DataFrame,
-    targets: dict[pd.Timestamp, dict[str, float]],
-    cost_bps: float,
-    cash_ticker: str | None = CASH_TICKER,
-) -> tuple[pd.Series, pd.Series]:
-    """Equity curve (starting at 1.0) and turnover for target weights applied at
-    the close of each key date in `targets`. Weights drift with prices between
-    rebalances. Cash is the residual and earns `cash_ticker`'s return.
-    """
-    tickers = list(prices.columns)
-    col = {t: i for i, t in enumerate(tickers)}
-    rets = prices.pct_change(fill_method=None).fillna(0.0).to_numpy()
-    if cash_ticker and cash_ticker in col:
-        cash_rets = rets[:, col[cash_ticker]]
-    else:
-        cash_rets = np.zeros(len(prices))
-
-    w = np.zeros(len(tickers))
-    w_cash = 1.0
-    value = 1.0
-    values, turns = [], []
-    for i, day in enumerate(prices.index):
-        if i > 0:
-            gross = 1.0 + w @ rets[i] + w_cash * cash_rets[i]
-            value *= gross
-            w = w * (1.0 + rets[i]) / gross
-            w_cash = w_cash * (1.0 + cash_rets[i]) / gross
-        turnover = 0.0
-        if day in targets:
-            new = np.zeros(len(tickers))
-            for t, wt in targets[day].items():
-                new[col[t]] = wt
-            turnover = float(np.abs(new - w).sum())
-            value *= 1.0 - turnover * cost_bps / 1e4
-            w = new
-            w_cash = 1.0 - new.sum()
-        values.append(value)
-        turns.append(turnover)
-    return (
-        pd.Series(values, index=prices.index, name="equity"),
-        pd.Series(turns, index=prices.index, name="turnover"),
-    )
+    @property
+    def returns(self) -> pd.Series:
+        return self.equity.pct_change().dropna()
 
 
 def run_backtest(
-    prices: pd.DataFrame,
-    macro: pd.DataFrame,
+    market: Market,
     config: BacktestConfig,
-    decide_fn: Callable[[pd.DataFrame, pd.DataFrame, pd.Timestamp], Decision] = decide,
+    params: Params = DEFAULT_PARAMS,
+    features: Features | None = None,
+    keep_decisions: bool = True,
 ) -> BacktestResult:
     config.validate()
-    end = config.effective_end()
     # Nothing on or after the holdout reaches the strategy unless unlocked.
-    prices = prices.loc[:end]
-    macro = macro.loc[:end]
-    sim = prices.loc[config.start:]
-    if len(sim) < 2:
+    market = market.truncate(config.effective_end())
+    if features is None or len(features.dates) != len(market.dates):
+        features = build_features(market, params)
+    strat = Strategy(market, features, params)
+    dates = market.dates
+    start = int(dates.searchsorted(pd.Timestamp(config.start)))
+    if start >= len(dates) - 1:
         raise ValueError("not enough sessions in the backtest window")
 
-    targets: dict[pd.Timestamp, dict[str, float]] = {}
-    decisions: list[Decision] = []
-    positions = {day: i for i, day in enumerate(sim.index)}
-    for signal_date in month_end_dates(sim.index):
-        exec_pos = positions[signal_date] + config.execution_delay
-        if exec_pos >= len(sim.index):
-            break
-        decision = decide_fn(prices, macro, signal_date)
-        decisions.append(decision)
-        targets[sim.index[exec_pos]] = decision.weights
+    opens = market.open.to_numpy(dtype=float)
+    col = strat.col
+    cash_ret = np.zeros(len(dates))
+    if config.cash_ticker in col:
+        c = strat.mark[:, col[config.cash_ticker]]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = c[1:] / c[:-1] - 1
+        cash_ret[1:] = np.where(np.isfinite(r), r, 0.0)
 
-    equity, turnover = simulate(sim, targets, config.cost_bps, config.cash_ticker)
-    weights = (
-        pd.DataFrame.from_dict(targets, orient="index")
-        .reindex(columns=sorted(sim.columns))
-        .fillna(0.0)
+    book = Book(cash=config.initial_capital, peak_equity=config.initial_capital)
+    pending: dict[int, list] = {}
+    fills, trips, decisions = [], [], []
+    meta: dict[str, dict] = {}  # per open position: entry facts and running cash flows
+    equity, invested = [], []
+    halted_on = None
+
+    for t in range(start, len(dates)):
+        day = dates[t]
+        if t > start and book.cash > 0:
+            book.cash *= 1 + cash_ret[t]
+        for order in pending.pop(t, []):
+            j = col[order.ticker]
+            px = opens[t, j] if np.isfinite(opens[t, j]) else strat.mark[t - 1, j]
+            if not np.isfinite(px):
+                continue
+            cost = cost_bps(order.ticker) * config.cost_multiplier / 1e4
+            fill_px = px * (1 + cost) if order.side == "buy" else px * (1 - cost)
+            qty = apply_fill(book, order, fill_px)
+            m = meta.get(order.ticker)
+            if qty > 0 and m is not None:
+                fills.append({
+                    "date": day, "ticker": order.ticker, "side": order.side, "quantity": qty,
+                    "price": fill_px, "cost_bps": cost * 1e4, "reason": order.reason,
+                })
+                if order.side == "buy":
+                    m["cost"] += qty * fill_px
+                    m["bought"] += qty
+                    m["first_fill"] = m["first_fill"] or day
+                else:
+                    m["proceeds"] += qty * fill_px
+            if order.ticker not in book.positions and m is not None:
+                if m["bought"] > 0:
+                    trips.append(_round_trip(order.ticker, m, day, dates))
+                del meta[order.ticker]
+
+        prices = strat.prices(t)
+        eq = book.equity(prices)
+        book.peak_equity = max(book.peak_equity, eq)
+        equity.append(eq)
+        invested.append(1 - book.cash / eq if eq > 0 else 0.0)
+
+        if (halted_on is None and config.drawdown_halt is not None
+                and eq < (1 - config.drawdown_halt) * book.peak_equity):
+            # Hard stop: flatten, then stay in cash for the rest of the run,
+            # as the live runner does until a human reviews it.
+            halted_on = str(day.date())
+            orders = []
+            for tk, pos in sorted(book.positions.items()):
+                pos.exiting = "drawdown_hard_stop"
+                if tk in meta:
+                    meta[tk]["reason"] = "drawdown_hard_stop"
+                if pos.shares > 0:
+                    orders.append(Order(tk, "sell", pos.shares, "drawdown_hard_stop"))
+            book.positions = {tk: p for tk, p in book.positions.items() if p.shares > 0}
+            pending = {t + config.execution_delay: orders} if t + config.execution_delay < len(dates) else {}
+            continue
+        if halted_on is None and t + config.execution_delay < len(dates):
+            decision = strat.step(t, book)
+            if decision.orders:
+                pending.setdefault(t + config.execution_delay, []).extend(decision.orders)
+                if keep_decisions:
+                    decisions.append(decision.to_dict())
+            for tk, pos in book.positions.items():
+                if tk not in meta:
+                    meta[tk] = {"entry_date": pos.entry_date, "initial_stop": pos.initial_stop,
+                                "rr": pos.rr_at_entry, "reason": None, "cost": 0.0,
+                                "proceeds": 0.0, "bought": 0.0, "first_fill": None}
+            for tk, reason in decision.exits.items():
+                if tk in meta:
+                    meta[tk]["reason"] = reason
+                    if tk not in book.positions and meta[tk]["bought"] == 0:
+                        del meta[tk]  # plan dropped before any fill
+
+    idx = dates[start:]
+    return BacktestResult(
+        equity=pd.Series(equity, index=idx, name="equity") / config.initial_capital,
+        invested=pd.Series(invested, index=idx, name="invested"),
+        trades=pd.DataFrame(fills),
+        round_trips=pd.DataFrame(trips),
+        decisions=decisions,
+        halted_on=halted_on,
+        config=config,
+        params=params,
     )
-    return BacktestResult(equity, turnover, weights, decisions, config)
+
+
+def _round_trip(ticker: str, m: dict, exit_day, dates) -> dict:
+    avg_entry = m["cost"] / m["bought"]
+    risk = (avg_entry - m["initial_stop"]) * m["bought"]
+    pnl = m["proceeds"] - m["cost"]
+    return {
+        "ticker": ticker, "entry_date": pd.Timestamp(m["entry_date"]), "exit_date": exit_day,
+        "reason": m["reason"], "cost": m["cost"], "proceeds": m["proceeds"], "pnl": pnl,
+        "return": pnl / m["cost"], "r_multiple": pnl / risk if risk > 0 else np.nan,
+        "rr_at_entry": m["rr"],
+        "sessions": int(dates.get_loc(exit_day) - dates.get_loc(m["first_fill"])),
+    }
 
 
 def fixed_weight_benchmark(
-    prices: pd.DataFrame, weights: dict[str, float], config: BacktestConfig, rebalance: bool
+    market: Market, weights: dict[str, float], config: BacktestConfig, rebalance_monthly: bool
 ) -> pd.Series:
-    """Buy-and-hold (rebalance=False) or monthly-rebalanced fixed weights, with
-    the same timing and costs as the strategy."""
+    """Buy-and-hold or monthly-rebalanced fixed weights, same timing and costs."""
     config.validate()
-    sim = prices.loc[config.start:config.effective_end()]
-    dates = month_end_dates(sim.index) if rebalance else [sim.index[0]]
-    positions = {day: i for i, day in enumerate(sim.index)}
-    targets = {}
-    for d in dates:
-        pos = positions[d] + (config.execution_delay if rebalance else 0)
-        if pos < len(sim.index):
-            targets[sim.index[pos]] = weights
-    equity, _ = simulate(sim, targets, config.cost_bps, config.cash_ticker)
-    return equity
+    m = market.truncate(config.effective_end())
+    close = m.close.ffill()
+    opens = m.open
+    dates = m.dates
+    start = int(dates.searchsorted(pd.Timestamp(config.start)))
+    period = dates.to_period("M")
+    rebal = {start + config.execution_delay}
+    if rebalance_monthly:
+        for t in range(start + 1, len(dates) - 1):
+            if period[t] != period[t + 1]:
+                rebal.add(t + config.execution_delay)
+    cash, shares = config.initial_capital, {tk: 0.0 for tk in weights}
+    out = []
+    for t in range(start, len(dates)):
+        if t in rebal:
+            eq = cash + sum(q * close[tk].iat[t - 1] for tk, q in shares.items())
+            for tk, w in weights.items():
+                px = opens[tk].iat[t]
+                cost = cost_bps(tk) * config.cost_multiplier / 1e4
+                target = w * eq / (px * (1 + cost))  # costs come out of the weight, not on margin
+                delta = target - shares[tk]
+                cash -= delta * px + abs(delta) * px * cost
+                shares[tk] = target
+        out.append(cash + sum(q * close[tk].iat[t] for tk, q in shares.items()))
+    return pd.Series(out, index=dates[start:], name="equity") / config.initial_capital

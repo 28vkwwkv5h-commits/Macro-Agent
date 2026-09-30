@@ -1,4 +1,4 @@
-"""Target minus actual equals the order list."""
+"""Orders, and target-versus-actual reconciliation."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -11,26 +11,12 @@ class Order:
     ticker: str
     side: str  # "buy" or "sell"
     quantity: float
-    order_type: str = "market"  # market-on-open on rebalance day (spec 6)
-    limit_price: float | None = None
+    reason: str = ""
+    decision_id: str = ""
+    order_type: str = "market"
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def diff_orders(
-    target: dict[str, float], current: dict[str, float], order_type: str = "market"
-) -> list[Order]:
-    """Sells first, so they fund the buys, then buys. Alphabetical within each
-    side, so the same inputs always produce the same order list."""
-    sells, buys = [], []
-    for t in sorted(set(target) | set(current)):
-        delta = target.get(t, 0.0) - current.get(t, 0.0)
-        if delta < -EPS:
-            sells.append(Order(t, "sell", round(-delta, 10), order_type))
-        elif delta > EPS:
-            buys.append(Order(t, "buy", round(delta, 10), order_type))
-    return sells + buys
 
 
 def reconcile(target: dict[str, float], actual: dict[str, float]) -> dict[str, float]:
@@ -38,6 +24,6 @@ def reconcile(target: dict[str, float], actual: dict[str, float]) -> dict[str, f
     diff = {}
     for t in sorted(set(target) | set(actual)):
         d = target.get(t, 0.0) - actual.get(t, 0.0)
-        if abs(d) > EPS:
+        if abs(d) > 1e-6:
             diff[t] = round(d, 10)
     return diff

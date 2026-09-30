@@ -1,10 +1,8 @@
-"""Per-series trend: sign of a 63-day change, confirmed against the 200-day MA."""
+"""Per-series trend: sign of a 63-day change, confirmed against the 200-day MA (spec 2.3)."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-
-from ..config import TREND_MA_WINDOW, TREND_ROC_WINDOW
 
 UP = 1
 FLAT = 0
@@ -12,10 +10,7 @@ DOWN = -1
 
 
 def trend_state(
-    series: pd.Series,
-    kind: str = "price",
-    roc_window: int = TREND_ROC_WINDOW,
-    ma_window: int = TREND_MA_WINDOW,
+    series: pd.Series, kind: str = "price", roc_window: int = 63, ma_window: int = 200
 ) -> pd.Series:
     """UP if the change is positive and the level is above its moving average,
     DOWN if negative and below, FLAT when the two disagree. NaN until there is

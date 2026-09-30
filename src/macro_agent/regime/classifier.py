@@ -1,6 +1,8 @@
 """Four-regime classifier from the six macro series (spec 2.3, audit-corrected).
 
-Directional read only. No Fibonacci scoring in the MVP (spec 20.5).
+Each input votes; the regime with the most votes wins and its vote share is the
+agreement term of the confidence score. Derived from market inputs only, not
+economic data.
 """
 from __future__ import annotations
 
@@ -8,12 +10,13 @@ import pandas as pd
 
 from ..config import (
     DEFLATION,
+    DEFAULT_PARAMS,
     GOLDILOCKS,
-    INVERSION_LOOKBACK,
     MACRO_SERIES,
     REFLATION,
     REGIME_ORDER,
     TIGHTENING,
+    Params,
 )
 from .trend import DOWN, FLAT, UP, trend_state
 
@@ -47,15 +50,18 @@ RULES = {
 INPUTS = tuple(MACRO_SERIES)
 
 
-def regime_states(macro: pd.DataFrame) -> pd.DataFrame:
+def regime_states(macro: pd.DataFrame, params: Params = DEFAULT_PARAMS) -> pd.DataFrame:
     """Trend state per macro input, plus whether the 2/10 was recently inverted."""
     states = pd.DataFrame(index=macro.index)
     for name in INPUTS:
         kind = MACRO_SERIES[name][2]
-        states[name] = trend_state(macro[name], kind=kind)
+        states[name] = trend_state(
+            macro[name], kind=kind,
+            roc_window=params.trend_roc_window, ma_window=params.trend_ma_window,
+        )
     spread = macro["spread_2s10s"]
     states["spread_was_inverted"] = (
-        spread.rolling(INVERSION_LOOKBACK, min_periods=1).min() < 0
+        spread.rolling(params.inversion_lookback, min_periods=1).min() < 0
     )
     return states
 
@@ -75,14 +81,14 @@ def votes(states: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def classify(macro: pd.DataFrame) -> pd.DataFrame:
+def classify(macro: pd.DataFrame, params: Params = DEFAULT_PARAMS) -> pd.DataFrame:
     """Daily regime and agreement (fraction of the six inputs voting for it).
 
     Rows where any input lacks history get regime None and agreement 0, which
     the confidence gate turns into cash. Ties go to the more defensive regime
     (REGIME_ORDER).
     """
-    states = regime_states(macro)
+    states = regime_states(macro, params)
     v = votes(states)
     # idxmax returns the first maximum, and columns are in REGIME_ORDER.
     best = v.idxmax(axis=1)

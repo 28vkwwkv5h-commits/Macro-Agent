@@ -1,4 +1,16 @@
-"""Guardrails. Every check either passes silently or raises Halt."""
+"""Guardrails (spec 7, 11.3). Every check either passes silently or raises Halt.
+
+There is no turnover cap. Rogue trading is caught by checking whether orders
+make sense, not by limiting how much the system may trade:
+
+- the portfolio the orders would produce must obey the spec's own limits
+  (position size, position count, sleeve and names caps, the regime whitelist,
+  no leverage, no shorts);
+- no run starts while the broker shows unfilled orders, and no decision is sent
+  twice (so a retry cannot double a trade);
+- a 20% peak-to-trough drawdown flattens the book and stops (spec 11.3);
+- the kill switch, the stale-data halt and dry run by default.
+"""
 from __future__ import annotations
 
 import json
@@ -10,7 +22,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..config import KILL_ENV_VAR, MAX_DAILY_TURNOVER, MAX_ORDERS_PER_DAY, STALE_BUSINESS_DAYS
+from ..config import (
+    KILL_ENV_VAR,
+    MAX_DRAWDOWN_HALT,
+    MAX_ORDERS_PER_DAY,
+    STALE_BUSINESS_DAYS,
+    TICKER_SLEEVE,
+    WHITELIST,
+    Params,
+)
+
+TOLERANCE = 0.02  # prices move between sizing and the check
 
 
 class Halt(RuntimeError):
@@ -22,12 +44,12 @@ class GuardConfig:
     kill_file: Path = field(default_factory=lambda: Path("state/KILL"))
     kill_env_var: str = KILL_ENV_VAR
     max_orders_per_day: int = MAX_ORDERS_PER_DAY
-    max_daily_turnover: float = MAX_DAILY_TURNOVER
     stale_business_days: int = STALE_BUSINESS_DAYS
+    max_drawdown: float = MAX_DRAWDOWN_HALT
 
 
 def kill_switch_engaged(cfg: GuardConfig) -> bool:
-    """A file or an env flag. Either one is enough."""
+    """A file or an env flag. Either one is enough. Trippable from a phone."""
     flag = os.environ.get(cfg.kill_env_var, "").strip().lower()
     return flag in {"1", "true", "yes", "on"} or Path(cfg.kill_file).exists()
 
@@ -60,17 +82,63 @@ def check_stale(frame: pd.DataFrame, as_of, max_business_days: int) -> None:
         raise Halt(f"stale data as of {as_of.date()}: {stale}")
 
 
-def check_orders(orders, prices: dict[str, float], equity: float, cfg: GuardConfig) -> float:
-    """Halt on too many orders or too much turnover. Returns the turnover."""
+def check_open_orders(open_orders: list) -> None:
+    if open_orders:
+        raise Halt(f"broker shows {len(open_orders)} unfilled order(s); refusing to trade on top of them")
+
+
+def check_drawdown(equity: float, peak: float, max_drawdown: float) -> None:
+    if peak > 0 and equity < (1 - max_drawdown) * peak:
+        raise Halt(f"drawdown {1 - equity / peak:.1%} breaches the {max_drawdown:.0%} hard stop")
+
+
+def check_orders(
+    orders,
+    holdings: dict[str, float],
+    cash: float,
+    prices: dict[str, float],
+    regime: str | None,
+    params: Params,
+    cfg: GuardConfig,
+) -> None:
+    """Halt unless the post-trade portfolio obeys the spec's limits."""
     if len(orders) > cfg.max_orders_per_day:
         raise Halt(f"{len(orders)} orders exceeds the daily maximum of {cfg.max_orders_per_day}")
-    traded = sum(o.quantity * prices[o.ticker] for o in orders)
-    turnover = traded / equity if equity > 0 else 0.0
-    if turnover > cfg.max_daily_turnover + 1e-12:
-        raise Halt(
-            f"turnover {turnover:.1%} exceeds the daily maximum of {cfg.max_daily_turnover:.0%}"
-        )
-    return turnover
+    after = dict(holdings)
+    cash_after = cash
+    buys = set()
+    for o in orders:
+        if o.quantity <= 0:
+            raise Halt(f"non-positive quantity in {o}")
+        if o.side == "sell":
+            if o.quantity > after.get(o.ticker, 0.0) + 1e-6:
+                raise Halt(f"sell of {o.quantity} {o.ticker} exceeds holding: would be a short")
+            after[o.ticker] = after.get(o.ticker, 0.0) - o.quantity
+            cash_after += o.quantity * prices[o.ticker]
+        else:
+            buys.add(o.ticker)
+            after[o.ticker] = after.get(o.ticker, 0.0) + o.quantity
+            cash_after -= o.quantity * prices[o.ticker]
+    if cash_after < -TOLERANCE * max(cash, 1.0):
+        raise Halt(f"orders need {-cash_after:,.2f} more cash than the account holds: no leverage")
+    equity = cash_after + sum(q * prices[t] for t, q in after.items() if q > 0)
+    if equity <= 0:
+        raise Halt("non-positive post-trade equity")
+    open_positions = [t for t, q in after.items() if q > 1e-9]
+    if len(open_positions) > params.full_positions:
+        raise Halt(f"{len(open_positions)} positions exceeds the maximum of {params.full_positions}")
+    allowed = WHITELIST.get(regime, frozenset()) if params.use_regime_whitelist else None
+    for t in sorted(buys):
+        if allowed is not None and t not in allowed:
+            raise Halt(f"buy of {t} is outside the {regime} whitelist")
+        weight = after[t] * prices[t] / equity
+        if weight > params.max_position + TOLERANCE:
+            raise Halt(f"{t} would be {weight:.1%} of the account, above {params.max_position:.0%}")
+        sleeve = TICKER_SLEEVE.get(t, "individual_names")
+        sleeve_w = sum(after[x] * prices[x] for x in open_positions if TICKER_SLEEVE.get(x, "individual_names") == sleeve) / equity
+        cap = params.max_names if sleeve == "individual_names" else params.max_sleeve
+        if sleeve_w > cap + TOLERANCE:
+            raise Halt(f"{sleeve} would be {sleeve_w:.1%} of the account, above {cap:.0%}")
 
 
 class AuditLog:

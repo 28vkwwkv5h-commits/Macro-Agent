@@ -1,15 +1,28 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from macro_agent.data import build_macro_frame, synthetic_market
+from macro_agent.data.market import Market
+from macro_agent.features import build_features
+from macro_agent.montecarlo import synthetic_market
 
 
 @pytest.fixture(scope="session")
-def market():
-    prices, fred = synthetic_market(start="2005-01-03", end="2012-12-31", seed=11)
-    return prices, build_macro_frame(prices, fred)
+def market() -> Market:
+    m, _ = synthetic_market(start="2005-01-03", end="2012-12-31", seed=11)
+    return m
 
 
-def flat_prices(tickers, n=400, start="2020-01-01", value=100.0) -> pd.DataFrame:
-    idx = pd.bdate_range(start, periods=n)
-    return pd.DataFrame({t: [value] * n for t in tickers}, index=idx, dtype=float)
+@pytest.fixture(scope="session")
+def features(market):
+    return build_features(market)
+
+
+def make_market(close: pd.DataFrame, macro: pd.DataFrame | None = None, spread: float = 0.01) -> Market:
+    """A Market from closes: open = previous close, high/low a fixed band around."""
+    open_ = close.shift(1).fillna(close)
+    high = np.maximum(open_, close) * (1 + spread)
+    low = np.minimum(open_, close) * (1 - spread)
+    volume = close * 0 + 1e6
+    macro = macro if macro is not None else pd.DataFrame(index=close.index)
+    return Market(open_, high, low, close, volume, macro)

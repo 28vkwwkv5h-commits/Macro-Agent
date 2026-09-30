@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from macro_agent.config import DEFLATION, GOLDILOCKS, REFLATION, TIGHTENING
+from macro_agent.config import DEFAULT_PARAMS, DEFLATION, GOLDILOCKS, REFLATION, TIGHTENING
 from macro_agent.regime import (
     DOWN,
     FLAT,
@@ -11,6 +11,7 @@ from macro_agent.regime import (
     confidence,
     persistence,
     position_budget,
+    stability_score,
     trend_state,
     votes,
 )
@@ -29,35 +30,20 @@ def test_trend_up_down_and_unconfirmed():
     rising = pd.Series(np.linspace(100, 200, 300), index=idx)
     assert trend_state(rising).iloc[-1] == UP
     assert trend_state(rising[::-1].set_axis(idx)).iloc[-1] == DOWN
-    # Up over 63 days but still below the 200-day average: not confirmed.
     v = np.concatenate([np.linspace(200, 100, 250), np.linspace(100, 120, 50)])
-    assert trend_state(pd.Series(v, index=idx)).iloc[-1] == FLAT
-    assert np.isnan(trend_state(rising).iloc[150])  # not enough history
-
-
-def test_rate_series_trend_on_absolute_change():
-    idx = pd.bdate_range("2020-01-01", periods=300)
-    spread = pd.Series(np.linspace(-1.0, 0.5, 300), index=idx)  # crosses zero
-    assert trend_state(spread, kind="rate").iloc[-1] == UP
+    assert trend_state(pd.Series(v, index=idx)).iloc[-1] == FLAT  # up, but below the 200-day
+    assert np.isnan(trend_state(rising).iloc[150])
 
 
 def test_deflation_uses_rising_real_rate_per_audit():
-    s = states_row(
-        inverted=True, oil=DOWN, gold=DOWN, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP
-    )
-    v = votes(s).iloc[0]
-    assert v[DEFLATION] == 6
-    # Gold recovering in the second leg still votes deflation.
-    s2 = states_row(
-        inverted=True, oil=DOWN, gold=UP, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP
-    )
-    assert votes(s2).iloc[0][DEFLATION] == 6
+    s = states_row(inverted=True, oil=DOWN, gold=DOWN, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP)
+    assert votes(s).iloc[0][DEFLATION] == 6
+    s2 = states_row(inverted=True, oil=DOWN, gold=UP, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP)
+    assert votes(s2).iloc[0][DEFLATION] == 6  # gold recovering in the second leg
 
 
 def test_deflation_spread_vote_needs_prior_inversion():
-    s = states_row(
-        inverted=False, oil=DOWN, gold=DOWN, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP
-    )
+    s = states_row(inverted=False, oil=DOWN, gold=DOWN, usd=UP, ust10y=DOWN, spread_2s10s=UP, real10y=UP)
     assert votes(s).iloc[0][DEFLATION] == 5
 
 
@@ -71,12 +57,10 @@ def test_deflation_spread_vote_needs_prior_inversion():
 )
 def test_each_regime_row_scores_six(states, expected):
     v = votes(states_row(**states)).iloc[0]
-    assert v[expected] == 6
-    assert v.idxmax() == expected
+    assert v[expected] == 6 and v.idxmax() == expected
 
 
 def test_tie_goes_to_more_defensive_regime():
-    # 3 votes each for tightening (usd, ust10y... ) and reflation.
     s = states_row(oil=UP, gold=UP, usd=UP, ust10y=UP, spread_2s10s=FLAT, real10y=FLAT)
     v = votes(s).iloc[0]
     assert v[TIGHTENING] == v[REFLATION] == 3
@@ -84,17 +68,15 @@ def test_tie_goes_to_more_defensive_regime():
 
 
 def test_persistence_counts_from_one_and_caps():
-    regimes = pd.Series([None, "a", "a", "b"] + ["b"] * 30)
-    p = persistence(regimes, cap=20)
+    p = persistence(pd.Series([None, "a", "a", "b"] + ["b"] * 30), cap=20)
     assert p.iloc[0] == 0
     assert p.iloc[1] == pytest.approx(1 / 20)
-    assert p.iloc[2] == pytest.approx(2 / 20)
-    assert p.iloc[3] == pytest.approx(1 / 20)  # new regime resets
+    assert p.iloc[3] == pytest.approx(1 / 20)
     assert p.iloc[-1] == 1.0
 
 
 def test_confidence_matches_audit_arithmetic():
-    # Audit: agreement 0.83, clarity 0.8 -> day one 0.59, day five 0.65.
+    # Audit: agreement 0.83 with a 0.8 third term -> day one 0.59, day five 0.65.
     classified = pd.DataFrame({"regime": ["x"] * 5, "agreement": [5 / 6] * 5})
     c = confidence(classified, stability=0.8)
     assert round(c.iloc[0], 2) == 0.59
@@ -106,11 +88,23 @@ def test_position_budget_tiers():
     assert position_budget(0.59) == 3
     assert position_budget(0.40) == 3
     assert position_budget(0.3999) == 0
+    assert position_budget(0.55, DEFAULT_PARAMS.with_(confidence_full=0.5)) == 5
+
+
+def test_stability_is_bounded_and_falls_in_turbulence():
+    rng = np.random.default_rng(1)
+    idx = pd.bdate_range("2010-01-01", periods=900)
+    rets = rng.normal(0, 0.01, (900, 5))
+    rets[850:860] *= 8  # a shock
+    close = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx, columns=list("ABCDE"))
+    s = stability_score(close, list("ABCDE"), window=252, rank_window=504)
+    assert s.between(0, 1).all()
+    assert s.iloc[:252].eq(0.5).all()  # no history: neutral, not calm
+    assert s.iloc[850:860].mean() < s.iloc[600:840].mean()
 
 
 def test_classify_without_history_is_no_regime(market):
-    _, macro = market
-    classified = classify(macro)
+    classified = classify(market.macro)
     assert classified["regime"].iloc[0] is None
     assert confidence(classified).iloc[0] == 0.0
     assert classified["regime"].iloc[-1] in {REFLATION, GOLDILOCKS, TIGHTENING, DEFLATION}

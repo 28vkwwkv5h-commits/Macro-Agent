@@ -1,13 +1,14 @@
-"""Fetch and cache prices and yields. Single source of truth."""
-from .fixtures import synthetic_market
-from .sources import FredSource, StooqSource, TiingoSource
-from .store import DataStore, build_macro_frame
+"""Fetch and cache prices, yields and positioning. Single source of truth."""
+from .market import Market
+from .sources import CftcSource, FredSource, StooqSource, TiingoSource
+from .store import DataStore, assemble_market
 
 __all__ = [
+    "CftcSource",
     "DataStore",
     "FredSource",
+    "Market",
     "StooqSource",
     "TiingoSource",
-    "build_macro_frame",
-    "synthetic_market",
+    "assemble_market",
 ]

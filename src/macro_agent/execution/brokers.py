@@ -1,7 +1,8 @@
-"""Venue adapters. Anything that implements `Broker` can run the book."""
+"""Venue adapters. Anything that implements `Broker` can run the book (spec 6)."""
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Protocol
 
@@ -13,7 +14,11 @@ class Broker(Protocol):
 
     def cash(self) -> float: ...
 
-    def place(self, order: Order, price: float) -> None: ...
+    def open_orders(self) -> list[dict]: ...
+
+    def place(self, order: Order, price: float) -> tuple[float, float]:
+        """Submit an order at about `price`; return (quantity filled, fill price)."""
+        ...
 
 
 class PaperBroker:
@@ -35,18 +40,24 @@ class PaperBroker:
     def cash(self) -> float:
         return self._cash
 
-    def equity(self, prices: dict[str, float]) -> float:
-        return self._cash + sum(q * prices[t] for t, q in self._positions.items())
+    def open_orders(self) -> list[dict]:
+        return []  # paper fills are immediate
 
-    def place(self, order: Order, price: float) -> None:
+    def place(self, order: Order, price: float) -> tuple[float, float]:
         sign = 1 if order.side == "buy" else -1
-        qty = self._positions.get(order.ticker, 0.0) + sign * order.quantity
-        self._cash -= sign * order.quantity * price
-        if abs(qty) < 1e-9:
+        qty = order.quantity
+        if order.side == "sell":
+            qty = min(qty, self._positions.get(order.ticker, 0.0))
+        else:
+            qty = min(qty, math.floor(max(self._cash, 0.0) / price * 1e6) / 1e6) if price > 0 else 0.0
+        new = self._positions.get(order.ticker, 0.0) + sign * qty
+        self._cash -= sign * qty * price
+        if abs(new) < 1e-9:
             self._positions.pop(order.ticker, None)
         else:
-            self._positions[order.ticker] = round(qty, 10)
+            self._positions[order.ticker] = round(new, 10)
         self._save()
+        return qty, price
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +70,8 @@ class RobinhoodMCPBroker:
 
     Not implemented: the MCP's tool names and schemas need to be confirmed
     against the live server before any order code is written. Use a dedicated
-    agentic account and keep the main account out of reach.
+    agentic account with no margin and no options permissions, and keep the
+    main account out of reach (spec 6, 11.2).
     """
 
     endpoint = "https://agent.robinhood.com/mcp/trading"
@@ -70,5 +82,8 @@ class RobinhoodMCPBroker:
     def cash(self) -> float:
         raise NotImplementedError("Robinhood MCP adapter not yet implemented")
 
-    def place(self, order: Order, price: float) -> None:
+    def open_orders(self) -> list[dict]:
+        raise NotImplementedError("Robinhood MCP adapter not yet implemented")
+
+    def place(self, order: Order, price: float) -> tuple[float, float]:
         raise NotImplementedError("Robinhood MCP adapter not yet implemented")
